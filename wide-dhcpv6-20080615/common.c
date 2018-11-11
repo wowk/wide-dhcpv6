@@ -1340,6 +1340,7 @@ dhcp6_init_options(optinfo)
 	optinfo->authproto = DHCP6_AUTHPROTO_UNDEF;
 	optinfo->authalgorithm = DHCP6_AUTHALG_UNDEF;
 	optinfo->authrdm = DHCP6_AUTHRDM_UNDEF;
+    optinfo->reconfig_msg_type = 0;
 }
 
 void
@@ -2472,7 +2473,15 @@ dhcp6_set_options(type, optbp, optep, optinfo)
 		}
 	}
 
-	if (optinfo->authproto != DHCP6_AUTHPROTO_UNDEF) {
+	if( optinfo->reconfigauth_type ){
+        uint8_t type = optinfo->reconfig_msg_type;
+        if( copy_option(DH6OPT_RECONF_MSG, sizeof(type), &type, &p, 
+            optep, &len) != 0){
+            goto fail;
+        }
+    }
+
+    if (optinfo->authproto != DHCP6_AUTHPROTO_UNDEF) {
 		struct dhcp6opt_auth *auth;
 		int authlen;
 		char *authinfo;
@@ -2485,12 +2494,10 @@ dhcp6_set_options(type, optbp, optep, optinfo)
 				authlen += optinfo->delayedauth_realmlen +
 				    sizeof(optinfo->delayedauth_keyid) + 16;
 				break;
-#ifdef notyet
 			case DHCP6_AUTHPROTO_RECONFIG:
 				/* type + key-or-HAMC */
 				authlen += 17;
 				break;
-#endif
 			default:
 				debug_printf(LOG_ERR, FNAME,
 				    "unexpected authentication protocol");
@@ -2539,10 +2546,14 @@ dhcp6_set_options(type, optbp, optep, optinfo)
 				    optinfo->delayedauth_keyid,
 				    optinfo->delayedauth_offset); 
 				break;
-#ifdef notyet
+
 			case DHCP6_AUTHPROTO_RECONFIG:
-#endif
-			default:
+                authinfo = (char*)(auth + 1);
+                *(uint8_t*)authinfo = (uint8_t)optinfo->reconfigauth_type;
+                optinfo->reconfigauth_offset = (char*)p - (char*)optbp + authlen - 16;
+			    break;
+
+            default:
 				debug_printf(LOG_ERR, FNAME,
 				    "unexpected authentication protocol");
 				free(auth);

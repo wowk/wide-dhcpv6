@@ -232,6 +232,7 @@ struct dhcp6_optinfo {
 #define reconfigauth_type authinfo.aiu_reconfig.type
 #define reconfigauth_offset authinfo.aiu_reconfig.offset
 #define reconfigauth_val authinfo.aiu_reconfig.val
+    int reconfig_msg_type;
 };
 
 /* DHCP6 base packet format */
@@ -381,5 +382,5 @@ enum { DHCP6_AUTHPROTO_UNDEF = -1, DHCP6_AUTHPROTO_DELAYED = 2,
        DHCP6_AUTHPROTO_RECONFIG = 3 };
 enum { DHCP6_AUTHALG_UNDEF = -1, DHCP6_AUTHALG_HMACMD5 = 1 };
 enum { DHCP6_AUTHRDM_UNDEF = -1, DHCP6_AUTHRDM_MONOCOUNTER = 0 };
-
+enum { DHCP6_AUTH_RECONFIG_TYPE_KEY = 1, DHCP6_AUTH_RECONFIG_TYPE_HMACMD5 = 2 };
 #endif /*__DHCP6_H_DEFINED*/

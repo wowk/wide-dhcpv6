@@ -32,6 +32,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/queue.h>
+#include <sys/sysinfo.h>
 #include <sys/uio.h>
 #if TIME_WITH_SYS_TIME
 # include <sys/time.h>
@@ -77,9 +78,9 @@
 #include <signal.h>
 #include <lease.h>
 
-#define DUID_FILE LOCALDBDIR "/dhcp6s_duid"
-#define DHCP6S_CONF SYSCONFDIR "/dhcp6s.conf"
-#define DEFAULT_KEYFILE SYSCONFDIR "/dhcp6sctlkey"
+#define DUID_FILE "/var/run/dhcp6s_duid"
+#define DHCP6S_CONF "/etc/dhcp6s.conf"
+#define DEFAULT_KEYFILE "/etc/dhcp6sctlkey"
 #define DHCP6S_PIDFILE "/var/run/dhcp6s.pid"
 
 #define CTLSKEW 300
@@ -125,7 +126,22 @@ TAILQ_HEAD(relayinfolist, relayinfo);
 
 static int debug = 0;
 static sig_atomic_t sig_flags = 0;
-#define SIGF_TERM 0x1
+#define SIGF_TERM (1 << (SIGTERM - 1))
+#define SIGF_USR1 (1 << (SIGUSR1 - 1))
+#define SIGF_USR2 (1 << (SIGUSR2 - 1))
+
+struct client_entry_t {
+	uint8_t type;
+	uint64_t expired;
+	unsigned ifindex;
+    struct dhcp6_optinfo optinfo;
+	struct sockaddr_storage saddr;
+	struct relayinfolist relayinfohead;
+    int reconfiging;
+	LIST_ENTRY(client_entry_t) entry;
+};
+LIST_HEAD(client_list_t, client_entry_t) client_list; 
+    
 
 const dhcp6_mode_t dhcp6_mode = DHCP6_MODE_SERVER;
 char *device = NULL;
@@ -221,6 +237,18 @@ static int process_auth __P((struct dhcp6 *, ssize_t, struct host_conf *,
     struct dhcp6_optinfo *, struct dhcp6_optinfo *));
 static inline char *clientstr __P((struct host_conf *, struct duid *));
 
+const char* client_info __P((struct client_entry_t* client));
+void update_clients_refreshtime __P((struct client_list_t* clist));
+void delete_client_from_list __P((struct client_list_t* clist, struct client_entry_t* client));
+void delete_client_by_duid __P((struct client_list_t* clist, struct duid* duid, struct sockaddr* from));
+void free_client __P((struct client_entry_t* client));
+void clear_relayinfolist __P((struct relayinfolist* tailq));
+int copy_relayinfolist __P((struct relayinfolist* dst, struct relayinfolist* src));
+int send_reconfig_to_client __P((struct client_entry_t* client));
+int add_client_to_list __P((struct client_list_t* clist, unsigned int ifindex, struct sockaddr* saddr, 
+                    struct relayinfolist* relayinfohead, struct dhcp6_optinfo* roptinfo));
+struct client_entry_t* find_client __P((struct client_list_t* clist, struct duid* duid, struct sockaddr* addr));
+
 int
 main(argc, argv)
 	int argc;
@@ -249,6 +277,7 @@ main(argc, argv)
 	TAILQ_INIT(&nispnamelist);
 	TAILQ_INIT(&bcmcslist);
 	TAILQ_INIT(&bcmcsnamelist);
+	LIST_INIT(&client_list);
 
 	srandom(time(NULL) & getpid());
 	while ((ch = getopt(argc, argv, "c:dDfk:n:p:P:")) != -1) {
@@ -582,6 +611,17 @@ server6_init()
 		    strerror(errno));
 		exit(1);
 	}
+    if (signal(SIGUSR1, server6_signal) == SIG_ERR) {
+		debug_printf(LOG_WARNING, FNAME, "failed to set signal: %s",
+		    strerror(errno));
+		exit(1);
+	}
+
+	if (signal(SIGUSR2, server6_signal) == SIG_ERR) {
+		debug_printf(LOG_WARNING, FNAME, "failed to set signal: %s",
+		    strerror(errno));
+		exit(1);
+	}  
 	return;
 }
 
@@ -592,6 +632,47 @@ process_signals()
 		unlink(pid_file);
 		exit(0);
 	}
+
+ 	if( (sig_flags & SIGF_USR1) ) {
+		sig_flags &= ~SIGF_USR1;
+		server6_reload();
+		struct client_entry_t* client;
+		struct client_entry_t* deleted = NULL;
+		struct dhcp6_if* ifp;
+
+		update_clients_refreshtime(&client_list);	
+		LIST_FOREACH(client, &client_list, entry){
+			if( deleted ){
+				free_client(deleted);
+				deleted = NULL;
+			}
+		   	ifp = find_ifconfbyid(client->ifindex);
+			if( !ifp ){
+				LIST_REMOVE(client, entry);
+				deleted = client;
+				continue;
+			}
+			send_reconfig_to_client(client);
+		}
+	}
+
+	if( (sig_flags & SIGF_USR2) ) {
+		sig_flags &= ~SIGF_USR2;
+		struct client_entry_t* client;
+		LIST_FOREACH(client, &client_list, entry){
+			char ipaddr[128] = "";
+			struct sockaddr_in6* si6 = (struct sockaddr_in6*)&client->saddr;
+
+			inet_ntop(AF_INET6, &si6->sin6_addr.s6_addr, ipaddr, sizeof(ipaddr));
+			debug_printf(LOG_NOTICE, FNAME, 
+					"duid    : %s, \n"
+					"\tifindex : %u, "
+					"\taddress : %s\n",
+					duidstr(&client->optinfo.clientID),
+					client->ifindex, 
+					ipaddr);
+		}
+	} 
 }
 
 static void
@@ -2000,6 +2081,7 @@ react_release(ifp, pi, dh6, len, optinfo, from, fromlen, relayinfohead)
 		goto fail;
 	}
 
+	delete_client_by_duid(&client_list, &optinfo->clientID, from);
 	(void)server6_send(DH6_REPLY, ifp, dh6, optinfo, from, fromlen,
 	    &roptinfo, relayinfohead, client_conf);
 
@@ -2689,9 +2771,232 @@ server6_signal(sig)
 	case SIGTERM:
 		sig_flags |= SIGF_TERM;
 		break;
+	case SIGUSR1:
+		sig_flags |= SIGF_USR1;
+		break;
+	case SIGUSR2:
+		sig_flags |= SIGF_USR2;
+		break;
 	}
 }
 
+const char* client_info(struct client_entry_t* client)
+{
+	size_t len = 0;
+	static char buffer[1024] = "";
+
+	len = sprintf(buffer+len, "client: %s, refreshtime: %llu", 
+						duidstr(&client->optinfo.clientID), client->expired);
+	buffer[len] = 0;
+
+	return buffer;
+}
+
+struct client_entry_t* find_client(clist, duid, addr)
+    struct client_list_t* clist;
+    struct duid* duid;
+    struct sockaddr* addr;
+{
+	struct client_entry_t* client = NULL;
+	
+    LIST_FOREACH(client, clist, entry){
+		if( duidcmp(&client->optinfo.clientID, duid) ){
+			continue;
+		}else if( memcmp(&client->saddr, addr, sizeof(struct sockaddr_in6)) ){
+			//sometimes, multi NICs in a host may use same DUID
+			//so, we also need to check client address
+			continue;
+		}
+		debug_printf(LOG_NOTICE, FNAME, "found old client: %s\n", duidstr(&client->optinfo.clientID));
+        break;
+	}
+
+    return client;
+}
+
+int add_client_to_list(clist, ifindex, saddr, relayinfohead, roptinfo)
+	struct client_list_t* clist;
+	unsigned int ifindex;
+	struct sockaddr* saddr;
+	struct relayinfolist* relayinfohead;
+	struct dhcp6_optinfo* roptinfo;
+{
+	struct client_entry_t* client = NULL;
+    
+    client = find_client(clist, &roptinfo->clientID, saddr);
+	if( client == NULL ){
+		client = (struct client_entry_t*)calloc(1, sizeof(struct client_entry_t));
+		if( !client ){
+			return -ENOMEM;
+		}
+        dhcp6_init_options(&client->optinfo);
+		duidcpy(&client->optinfo.clientID, &roptinfo->clientID);
+		duidcpy(&client->optinfo.serverID, &roptinfo->serverID);
+		LIST_INSERT_HEAD(clist, client, entry);
+		TAILQ_INIT(&client->relayinfohead);
+		debug_printf(LOG_NOTICE, FNAME, "add new client: %s\n", duidstr(&client->optinfo.clientID));
+	}else{
+		clear_relayinfolist(&client->relayinfohead);
+	}
+	
+	if( TAILQ_EMPTY(&roptinfo->iana_list) && TAILQ_EMPTY(&roptinfo->iapd_list) ){
+		client->type = (uint8_t)DH6_INFORM_REQ;
+	}else{
+		client->type = (uint8_t)DH6_RENEW;
+	}
+
+	struct sysinfo sinfo;
+	sysinfo(&sinfo);
+	client->expired	= sinfo.uptime + optrefreshtime * 2;
+
+	client->ifindex	= ifindex;
+	memcpy(&client->saddr, saddr, sizeof(struct sockaddr_in6));
+	
+	copy_relayinfolist(&client->relayinfohead, relayinfohead);
+	
+	client->optinfo.authproto	= roptinfo->authproto;
+	client->optinfo.authalgorithm = roptinfo->authalgorithm;
+	client->optinfo.authrdm		= roptinfo->authrdm;
+	client->optinfo.authrd		= roptinfo->authrd;
+    client->optinfo.reconfigauth_type = DHCP6_AUTH_RECONFIG_TYPE_HMACMD5;
+    memcpy(client->optinfo.reconfigauth_val, roptinfo->reconfigauth_val, 16);
+
+	return 0;
+}
+
+int send_reconfig_to_client(client)
+	struct client_entry_t* client;
+{
+	int ret; 
+    struct dhcp6 fakemsg;
+	struct dhcp6_optinfo roptinfo;
+    struct dhcp6_if* ifp;
+    
+    dhcp6_init_options(&roptinfo);
+    fakemsg.dh6_xid = 0;
+    memset(&fakemsg, 0, sizeof(fakemsg));
+    ifp = find_ifconfbyid(client->ifindex); 
+    
+    duidcpy(&roptinfo.clientID, &client->optinfo.clientID);
+    duidcpy(&roptinfo.serverID, &client->optinfo.serverID);
+    roptinfo.reconfig_msg_type = client->type; 
+    memcpy(&roptinfo.authinfo, &client->optinfo.authinfo, sizeof(roptinfo.authinfo));
+
+    ret = server6_send(DH6_RECONFIGURE, ifp, &fakemsg, &client->optinfo, (struct sockaddr*)&client->saddr, 
+                            sizeof(struct sockaddr_in6), &roptinfo, &client->relayinfohead, NULL);
+    client->reconfiging = 1;
+    client->optinfo.reconfig_msg_type = 0;
+
+	return (ret);
+}
+
+int copy_relayinfolist(dst, src)
+	struct relayinfolist* dst;
+	struct relayinfolist* src;
+{
+	struct relayinfo* relayinfo;
+	clear_relayinfolist(dst);
+
+	TAILQ_FOREACH(relayinfo, src, link){
+		struct relayinfo* new_relayinfo = 
+				(struct relayinfo*)malloc(sizeof(struct relayinfo));
+		memcpy(new_relayinfo, relayinfo, sizeof(struct relayinfo));
+		dhcp6_vbuf_copy(&new_relayinfo->relay_ifid, &relayinfo->relay_ifid);
+		dhcp6_vbuf_copy(&new_relayinfo->relay_msg, &relayinfo->relay_msg);
+		TAILQ_INSERT_HEAD(dst, new_relayinfo, link);
+	}
+}
+
+void clear_relayinfolist(tailq)
+	struct relayinfolist* tailq;
+{
+	struct relayinfo* relayinfo;
+
+	while( NULL != (relayinfo = TAILQ_FIRST(tailq)) ) {
+		TAILQ_REMOVE(tailq, relayinfo, link);
+		free_relayinfo(relayinfo);
+	}
+}
+
+
+void free_client(client)
+	struct client_entry_t* client;
+{
+	debug_printf(LOG_NOTICE, FNAME, "delete client: %s\n", duidstr(&client->optinfo.clientID));
+	clear_relayinfolist(&client->relayinfohead);
+	dhcp6_clear_options(&client->optinfo);
+	free(client);
+}
+
+void delete_client_by_duid(clist, duid, from)
+	struct client_list_t* clist;
+	struct duid* duid;
+    struct sockaddr* from;
+{
+	struct client_entry_t* client;
+
+	LIST_FOREACH(client, clist, entry){
+		if( duidcmp(&client->optinfo.clientID, duid) ){
+			continue;
+		}
+		else if( memcmp(&client->saddr, from, sizeof(client->saddr)) ){
+			continue;
+		}
+		break;
+	}
+	if( client ){
+		debug_printf(LOG_NOTICE, FNAME, "delete client:\n%s\n", client_info(client));
+		LIST_REMOVE(client, entry);
+		free_client(client);
+	}
+}
+
+void delete_client_from_list(clist, client)
+	struct client_list_t* clist;
+   	struct client_entry_t* client;
+{
+	if( client ){
+		debug_printf(LOG_NOTICE, FNAME, "\ndelete client:\n%s\n", client_info(client));
+		LIST_REMOVE(client, entry);
+		LIST_REMOVE(client, entry);
+		free_client(client);
+	}
+}
+
+void update_clients_refreshtime(clist)
+	struct client_list_t* clist;
+{
+	struct client_entry_t* client = NULL;
+	struct client_entry_t* deleted_client = NULL;
+	struct sysinfo sinfo;
+
+	sysinfo(&sinfo);
+	LIST_FOREACH(client, clist, entry){
+		if( deleted_client ){
+			delete_client_from_list(clist, deleted_client);
+			deleted_client = NULL;
+		}
+		
+		if( client->expired < sinfo.uptime ){
+			deleted_client = client;
+		}
+	}
+	
+	if( deleted_client ){
+		delete_client_from_list(clist, deleted_client);
+		deleted_client = NULL;
+	}
+} 
+
+static void generate_key(uint8_t* buf)
+{
+    uint32_t* p = (uint32_t*)buf;
+    srandom((unsigned long)clock());
+    for( int i = 0 ; i < 4 ; i ++ ){
+        p[i] = (uint32_t)random();
+    }
+}
+    
 static int
 server6_send(type, ifp, origmsg, optinfo, from, fromlen,
     roptinfo, relayinfohead, client_conf)
@@ -2721,7 +3026,30 @@ server6_send(type, ifp, origmsg, optinfo, from, fromlen,
 	memset(dh6, 0, sizeof(*dh6));
 	dh6->dh6_msgtypexid = origmsg->dh6_msgtypexid;
 	dh6->dh6_msgtype = (u_int8_t)type;
-
+ 
+    struct client_entry_t* client = find_client(&client_list, &roptinfo->clientID, (struct sockaddr*)from);
+    if( type == DH6_REPLY && optinfo->authproto == DHCP6_AUTHPROTO_UNDEF 
+            && (origmsg->dh6_msgtype == DH6_SOLICIT || origmsg->dh6_msgtype == DH6_INFORM_REQ || origmsg->dh6_msgtype == DH6_REQUEST)){
+        roptinfo->authproto         = DHCP6_AUTHPROTO_RECONFIG;
+        roptinfo->authalgorithm     = DHCP6_AUTHALG_HMACMD5;
+        roptinfo->authrdm           = DHCP6_AUTHRDM_MONOCOUNTER;
+        roptinfo->reconfigauth_type = DHCP6_AUTH_RECONFIG_TYPE_KEY;
+        roptinfo->authrd            = (uint64_t)time(NULL);
+        roptinfo->reconfig_msg_type = 0;
+        generate_key(roptinfo->reconfigauth_val);   
+        debug_printf(LOG_NOTICE, FNAME, "\033[1;32m;Add AUTH INFO to REPLY message\033\[1;0m");
+    }else if( type == DH6_RECONFIGURE ){
+        roptinfo->authproto         = DHCP6_AUTHPROTO_RECONFIG;
+        roptinfo->authalgorithm     = DHCP6_AUTHALG_HMACMD5;
+        roptinfo->authrdm           = DHCP6_AUTHRDM_MONOCOUNTER;
+        roptinfo->reconfigauth_type = DHCP6_AUTH_RECONFIG_TYPE_HMACMD5;
+        roptinfo->authrd            = (uint64_t)time(NULL);
+        debug_printf(LOG_NOTICE, FNAME, "\033[1;32m;SEND RECONFIGURE MESSAGE\033\[1;0m");
+    }else{
+        roptinfo->authproto         = DHCP6_AUTHPROTO_UNDEF;
+        roptinfo->reconfig_msg_type = 0;
+    }
+ 
 	/* set options in the reply message */
 	if ((optlen = dhcp6_set_options(type, (struct dhcp6opt *)(dh6 + 1),
 	    (struct dhcp6opt *)(replybuf + sizeof(replybuf)), roptinfo)) < 0) {
@@ -2747,7 +3075,33 @@ server6_send(type, ifp, origmsg, optinfo, from, fromlen,
 			return (-1);
 		}
 		break;
-	default:
+
+    case DHCP6_AUTHPROTO_RECONFIG:
+        if( roptinfo->reconfigauth_type == DHCP6_AUTH_RECONFIG_TYPE_HMACMD5 ){
+            struct client_entry_t* client = find_client(&client_list, &roptinfo->clientID, from);
+            if( !client ){
+                return (-1);
+            }
+
+            struct keyinfo key;
+            key.secret = roptinfo->reconfigauth_val;
+            key.secretlen = 16;
+            
+            if(dhcp6_calc_mac((char*)dh6, len, roptinfo->authproto,
+                        roptinfo->authalgorithm,
+                        roptinfo->reconfigauth_offset + sizeof(*dh6),
+                        &key)) {
+                debug_printf(LOG_WARNING, FNAME, "failed to calculate MAC");
+                return (-1);
+            }
+        
+        }else if( roptinfo->reconfigauth_type == DHCP6_AUTH_RECONFIG_TYPE_KEY ){
+            memcpy((char*)dh6 + sizeof(*dh6) + roptinfo->reconfigauth_offset, 
+                                    roptinfo->reconfigauth_val, 16); 
+        }
+        break;
+	
+    default:
 		break;		/* do nothing */
 	}
 
@@ -2810,6 +3164,10 @@ server6_send(type, ifp, origmsg, optinfo, from, fromlen,
 
 	debug_printf(LOG_DEBUG, FNAME, "transmit %s to %s",
 	    dhcp6msgstr(type), addr2str((struct sockaddr *)&dst));
+    
+    if( type == DH6_REPLY ){
+        add_client_to_list(&client_list, ifp->ifid, (struct sockaddr*)from, relayinfohead, roptinfo);
+    }
 
 	return (0);
 }
