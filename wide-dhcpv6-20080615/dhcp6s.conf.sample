@@ -2,12 +2,14 @@
 # for every client as well as to delegate a permanent IPv6 prefix
 # 2001:db8:1111::/48 to a client whose DUID is 00:01:00:01:aa:bb.
 
+option refreshtime  86400;
 option domain-name-servers 2001:db8::35;
 
 host kame {
 	duid 00:01:00:01:aa:bb;
 	prefix 2001:db8:1111::/48 infinity;
 };
+
 
 # The followings are a sample configuration to provide an IPv6 address
 # from an address pool 2001:db8:1:2::1000-2000 for 3600[s].
@@ -16,10 +18,18 @@ host kame {
 # stateless address configuration via RA, please set the autonomous-flag to
 # OFF in your RA configuration.
 
-interface fxp0 {
-	address-pool pool1 3600;
+interface enp12s0 {
+    allow rapid-commit;
+    preference 255;
+    address-pool pool1 6000;
 };
 
 pool pool1 {
-	range 2001:db8:1:2::1000 to 2001:db8:1:2::2000 ;
+    range 2001:db8:1111::10 to 2001:db8:1111::1000;
+};
+
+keyinfo kame{
+    realm "";
+    keyid   1;
+    secret "1234567890ABCDEF";
 };
