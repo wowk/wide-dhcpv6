@@ -36,7 +36,7 @@ localdbdir= @localdbdir@
 user= @user@
 group= @group@
 
-CFLAGS=	@CFLAGS@ @DEFS@ -DSYSCONFDIR=\"${sysconfdir}\" \
+CFLAGS=	-std=c99 -D_GNU_SOURCE @CFLAGS@ @DEFS@ -DSYSCONFDIR=\"${sysconfdir}\" \
 	-DLOCALDBDIR=\"${localdbdir}\"
 LDFLAGS=@LDFLAGS@
 LIBOBJS=@LIBOBJS@
