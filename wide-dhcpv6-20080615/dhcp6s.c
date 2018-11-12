@@ -2885,7 +2885,6 @@ int send_reconfig_to_client(client)
     ret = server6_send(DH6_RECONFIGURE, ifp, &fakemsg, &client->optinfo, (struct sockaddr*)&client->saddr, 
                             sizeof(struct sockaddr_in6), &roptinfo, &client->relayinfohead, NULL);
     client->reconfiging = 1;
-    client->optinfo.reconfig_msg_type = 0;
 
 	return (ret);
 }
@@ -3043,6 +3042,7 @@ server6_send(type, ifp, origmsg, optinfo, from, fromlen,
         roptinfo->authalgorithm     = DHCP6_AUTHALG_HMACMD5;
         roptinfo->authrdm           = DHCP6_AUTHRDM_MONOCOUNTER;
         roptinfo->reconfigauth_type = DHCP6_AUTH_RECONFIG_TYPE_HMACMD5;
+        roptinfo->reconfig_msg_type = client->type;
         roptinfo->authrd            = (uint64_t)time(NULL);
         debug_printf(LOG_NOTICE, FNAME, "\033[1;32m;SEND RECONFIGURE MESSAGE\033\[1;0m");
     }else{

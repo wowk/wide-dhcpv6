@@ -2473,7 +2473,7 @@ dhcp6_set_options(type, optbp, optep, optinfo)
 		}
 	}
 
-	if( optinfo->reconfigauth_type ){
+	if( optinfo->reconfig_msg_type ){
         uint8_t type = optinfo->reconfig_msg_type;
         if( copy_option(DH6OPT_RECONF_MSG, sizeof(type), &type, &p, 
             optep, &len) != 0){
